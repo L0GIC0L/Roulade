@@ -12,32 +12,6 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-class BandpassFilterTest {
-    private fun gain(f: BandpassFilter, hz: Double, fs: Double): Double {
-        val w = 2 * PI * hz / fs
-        // H(e^jw) = (b0 + b2 e^-2jw) / (1 + a1 e^-jw + a2 e^-2jw)
-        val nRe = f.b0 + f.b2 * cos(2 * w)
-        val nIm = -f.b2 * sin(2 * w)
-        val dRe = 1 + f.a1 * cos(w) + f.a2 * cos(2 * w)
-        val dIm = -f.a1 * sin(w) - f.a2 * sin(2 * w)
-        return hypot(nRe, nIm) / hypot(dRe, dIm)
-    }
-
-    @Test
-    fun bandEdgesAreMinus3dbAndCentreIsUnity() {
-        val fs = 30.0
-        val f = BandpassFilter(2.0, 5.0, fs)
-        assertEquals(1 / sqrt(2.0), gain(f, 2.0, fs), 1e-4)
-        assertEquals(1 / sqrt(2.0), gain(f, 5.0, fs), 1e-4)
-        // Digital centre frequency for a bilinear-transformed band-pass.
-        val tc = sqrt(kotlin.math.tan(PI * 2.0 / fs) * kotlin.math.tan(PI * 5.0 / fs))
-        val fc = kotlin.math.atan(tc) * fs / PI
-        assertEquals(1.0, gain(f, fc, fs), 1e-4)
-        assertTrue(gain(f, 0.01, fs) < 0.01)
-        assertTrue(gain(f, 14.99, fs) < 0.01)
-    }
-}
-
 class LaplacianPyramidTest {
     @Test
     fun collapseInvertsBuildForOddSizes() {

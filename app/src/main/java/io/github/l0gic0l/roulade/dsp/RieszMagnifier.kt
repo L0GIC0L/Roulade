@@ -2,8 +2,30 @@ package io.github.l0gic0l.roulade.dsp
 
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
+
+/** Tuning for [RieszMagnifier]. */
+data class MagnifierOptions(
+    /** Phase gain; in-band motion grows by roughly `1 + alpha`. */
+    val alpha: Float,
+    val lowHz: Double,
+    val highHz: Double,
+    val frameRateHz: Double,
+    /** Butterworth order of the temporal band-pass (1–3). Higher isolates a mode more sharply. */
+    val filterOrder: Int = 1,
+    /** Sigma of the amplitude-weighted phase smoothing; 0 disables it. */
+    val denoiseSigma: Float = 2f,
+    /** Number of finest pyramid levels left unamplified (suppresses noise and fine-edge artifacts). */
+    val skipFineLevels: Int = 0,
+    /** Largest phase shift applied, in radians; 0 = no limit. Limits ghosting at high gain. */
+    val phaseLimit: Float = 0f,
+    /** Track per-pixel in-band motion energy for [heatmap]. */
+    val trackEnergy: Boolean = false,
+)
 
 /**
  * Phase-based motion magnification using the Riesz pyramid
@@ -13,7 +35,7 @@ import kotlin.math.sqrt
  * Each frame is split into a Laplacian pyramid. Per pixel and per level, the approximate Riesz
  * transform gives a local phase and orientation. The frame-to-frame phase change is accumulated,
  * band-pass filtered in time, smoothed spatially (weighted by local amplitude), multiplied by
- * [alpha] and applied back as a phase shift. Motion inside the frequency band is enlarged by
+ * alpha and applied back as a phase shift. Motion inside the frequency band is enlarged by
  * roughly `1 + alpha`; everything else passes through unchanged.
  *
  * The filter is causal, so frames are processed one at a time with constant memory.
@@ -22,19 +44,33 @@ import kotlin.math.sqrt
 class RieszMagnifier(
     val width: Int,
     val height: Int,
-    private val alpha: Float,
-    lowHz: Double,
-    highHz: Double,
-    frameRateHz: Double,
-    blurSigma: Float = 2f,
+    private val options: MagnifierOptions,
 ) {
+    constructor(
+        width: Int,
+        height: Int,
+        alpha: Float,
+        lowHz: Double,
+        highHz: Double,
+        frameRateHz: Double,
+    ) : this(width, height, MagnifierOptions(alpha, lowHz, highHz, frameRateHz))
+
     private val pyramid = LaplacianPyramid(width, height, LaplacianPyramid.levelsFor(width, height))
-    private val filter = BandpassFilter(lowHz, highHz, frameRateHz)
-    private val kernel = ImageOps.gaussianKernel(blurSigma)
-    private val levels = Array(pyramid.levels) { Level(pyramid.widths[it], pyramid.heights[it]) }
+    private val filter = BandpassFilter(options.filterOrder, options.lowHz, options.highHz, options.frameRateHz)
+    private val sections = filter.sections.toTypedArray()
+    private val kernel = if (options.denoiseSigma > 0f) ImageOps.gaussianKernel(options.denoiseSigma) else null
+    private val firstLevel = options.skipFineLevels.coerceIn(0, pyramid.levels - 1)
+    private val levels = Array(pyramid.levels) { k ->
+        if (k >= firstLevel) Level(pyramid.widths[k], pyramid.heights[k], sections.size) else null
+    }
     private var firstFrame = true
 
-    private class Level(val w: Int, val h: Int) {
+    // Motion-energy map (heatmap) state, kept on one mid-sized level.
+    private val energyLevel = max(firstLevel, min(2, pyramid.levels - 1))
+    private val energy = if (options.trackEnergy) FloatArray(pyramid.widths[energyLevel] * pyramid.heights[energyLevel]) else null
+    private val energyRate = (1.0 - exp(-1.0 / (options.frameRateHz * ENERGY_TIME_CONSTANT_S))).toFloat()
+
+    private class Level(val w: Int, val h: Int, sectionCount: Int) {
         val n = w * h
 
         // Riesz coefficients of the previous frame (after a frame is processed: the current one).
@@ -42,13 +78,11 @@ class RieszMagnifier(
         val prevX = FloatArray(n)
         val prevY = FloatArray(n)
 
-        // Accumulated phase (times orientation) and the band-pass filter state for each component.
+        // Accumulated phase (times orientation) and the band-pass state, two registers per section.
         val phaseCos = FloatArray(n)
         val phaseSin = FloatArray(n)
-        val regCos0 = FloatArray(n)
-        val regCos1 = FloatArray(n)
-        val regSin0 = FloatArray(n)
-        val regSin1 = FloatArray(n)
+        val regCos = Array(2 * sectionCount) { FloatArray(n) }
+        val regSin = Array(2 * sectionCount) { FloatArray(n) }
 
         // Scratch for the amplitude-weighted blur.
         val numCos = FloatArray(n)
@@ -63,19 +97,48 @@ class RieszMagnifier(
     fun process(input: FloatArray, output: FloatArray) {
         require(input.size >= width * height && output.size >= width * height)
         pyramid.build(input)
-        for (k in 0 until pyramid.levels) processLevel(levels[k], pyramid.bands[k])
+        for (k in 0 until pyramid.levels) {
+            val level = levels[k] ?: continue
+            processLevel(level, pyramid.bands[k], k == energyLevel)
+        }
         pyramid.collapse(output)
         firstFrame = false
     }
 
-    private fun processLevel(s: Level, band: FloatArray) {
+    /**
+     * Writes the in-band motion map (RMS filtered phase, radians, smoothed over ~0.5 s) at full
+     * resolution into [out]. Only available when [MagnifierOptions.trackEnergy] is set.
+     */
+    fun heatmap(out: FloatArray) {
+        val e = energy ?: error("Energy tracking is off")
+        val lw = pyramid.widths[energyLevel]
+        val lh = pyramid.heights[energyLevel]
+        val sx = lw.toFloat() / width
+        val sy = lh.toFloat() / height
+        Parallel.forRange(height) { y0, y1 ->
+            for (y in y0 until y1) {
+                val fy = ((y + 0.5f) * sy - 0.5f).coerceIn(0f, (lh - 1).toFloat())
+                val iy = fy.toInt()
+                val ty = fy - iy
+                val iy1 = min(iy + 1, lh - 1)
+                for (x in 0 until width) {
+                    val fx = ((x + 0.5f) * sx - 0.5f).coerceIn(0f, (lw - 1).toFloat())
+                    val ix = fx.toInt()
+                    val tx = fx - ix
+                    val ix1 = min(ix + 1, lw - 1)
+                    val top = e[iy * lw + ix] * (1 - tx) + e[iy * lw + ix1] * tx
+                    val bottom = e[iy1 * lw + ix] * (1 - tx) + e[iy1 * lw + ix1] * tx
+                    out[y * width + x] = sqrt(max(0f, top * (1 - ty) + bottom * ty))
+                }
+            }
+        }
+    }
+
+    private fun processLevel(s: Level, band: FloatArray, trackEnergy: Boolean) {
         val w = s.w
         val h = s.h
         val first = firstFrame
-        val b0 = filter.b0
-        val b2 = filter.b2
-        val a1 = filter.a1
-        val a2 = filter.a2
+        val secs = sections
 
         // 1) Riesz transform, phase difference to the previous frame, temporal band-pass.
         Parallel.forRange(h) { y0, y1 ->
@@ -122,13 +185,24 @@ class RieszMagnifier(
                         s.phaseSin[i] = ps
                     }
 
-                    val fc = b0 * pc + s.regCos0[i]
-                    s.regCos0[i] = s.regCos1[i] - a1 * fc
-                    s.regCos1[i] = b2 * pc - a2 * fc
+                    var fc = pc
+                    var fs = ps
+                    for (k in secs.indices) {
+                        val sec = secs[k]
+                        val r0c = s.regCos[2 * k]
+                        val r1c = s.regCos[2 * k + 1]
+                        val yc = sec.b0 * fc + r0c[i]
+                        r0c[i] = sec.b1 * fc + r1c[i] - sec.a1 * yc
+                        r1c[i] = sec.b2 * fc - sec.a2 * yc
+                        fc = yc
 
-                    val fs = b0 * ps + s.regSin0[i]
-                    s.regSin0[i] = s.regSin1[i] - a1 * fs
-                    s.regSin1[i] = b2 * ps - a2 * fs
+                        val r0s = s.regSin[2 * k]
+                        val r1s = s.regSin[2 * k + 1]
+                        val ys = sec.b0 * fs + r0s[i]
+                        r0s[i] = sec.b1 * fs + r1s[i] - sec.a1 * ys
+                        r1s[i] = sec.b2 * fs - sec.a2 * ys
+                        fs = ys
+                    }
 
                     val amp = sqrt(qAmp)
                     s.amplitude[i] = amp
@@ -139,18 +213,46 @@ class RieszMagnifier(
         }
 
         // 2) Amplitude-weighted spatial smoothing of the filtered phase (reduces noise).
-        ImageOps.blur(s.numCos, w, h, kernel, s.tmp)
-        ImageOps.blur(s.numSin, w, h, kernel, s.tmp)
-        ImageOps.blur(s.amplitude, w, h, kernel, s.tmp)
+        kernel?.let {
+            ImageOps.blur(s.numCos, w, h, it, s.tmp)
+            ImageOps.blur(s.numSin, w, h, it, s.tmp)
+            ImageOps.blur(s.amplitude, w, h, it, s.tmp)
+        }
+
+        // Motion energy for the heatmap: filtered phase power, weighted by how much texture
+        // (amplitude) backs it so flat, noisy areas stay cool.
+        val e = if (trackEnergy) energy else null
+        if (e != null) {
+            var sum = 0.0
+            for (i in 0 until s.n) sum += s.amplitude[i]
+            val meanAmp = (sum / s.n).toFloat() + EPS
+            val rate = energyRate
+            Parallel.forRange(s.n, minChunk = 4096) { start, end ->
+                for (i in start until end) {
+                    val den = s.amplitude[i] + EPS
+                    val fc = s.numCos[i] / den
+                    val fs = s.numSin[i] / den
+                    val confidence = den / (den + meanAmp)
+                    e[i] += rate * ((fc * fc + fs * fs) * confidence - e[i])
+                }
+            }
+        }
 
         // 3) Amplify and apply the phase shift; keep only the real part.
-        val alpha = alpha
+        val alpha = options.alpha
+        val limit = options.phaseLimit
         Parallel.forRange(s.n, minChunk = 4096) { start, end ->
             for (i in start until end) {
                 val den = s.amplitude[i] + EPS
-                val pc = alpha * s.numCos[i] / den
-                val ps = alpha * s.numSin[i] / den
-                val mag = sqrt(pc * pc + ps * ps)
+                var pc = alpha * s.numCos[i] / den
+                var ps = alpha * s.numSin[i] / den
+                var mag = sqrt(pc * pc + ps * ps)
+                if (limit > 0f && mag > limit) {
+                    val scale = limit / mag
+                    pc *= scale
+                    ps *= scale
+                    mag = limit
+                }
                 if (mag > EPS) {
                     val sinOverMag = sin(mag) / mag
                     band[i] = cos(mag) * band[i] - sinOverMag * (pc * s.prevX[i] + ps * s.prevY[i])
@@ -161,5 +263,6 @@ class RieszMagnifier(
 
     private companion object {
         const val EPS = 1e-6f
+        const val ENERGY_TIME_CONSTANT_S = 0.5
     }
 }

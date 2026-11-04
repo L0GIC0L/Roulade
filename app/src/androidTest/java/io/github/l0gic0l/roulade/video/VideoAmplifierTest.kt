@@ -5,6 +5,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import io.github.l0gic0l.roulade.analysis.AnalysisSettings
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -31,8 +32,9 @@ class VideoAmplifierTest {
         assertEquals(30f, info.frameRate, 0.5f)
 
         val output = File(context.cacheDir, "vibrating_bar_amplified.mp4")
-        val settings = AmplifySettings(alpha = 30f, lowHz = 2.0, highHz = 4.5, captureFps = 30.0, shortSide = 360)
-        VideoAmplifier(context).amplify(Uri.fromFile(input), info, settings, output) {}
+        val settings = AnalysisSettings(alpha = 30f, lowHz = 2.0, highHz = 4.5, captureFps = 30.0, shortSide = 360, stabilize = false)
+        val clip = Clip(Uri.fromFile(input), info, null, "test")
+        VideoAmplifier(context).amplify(clip, settings, output) { _, _ -> }
 
         val (inFrames, inAmp) = barMotion(input)
         val (outFrames, outAmp) = barMotion(output)

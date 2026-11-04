@@ -149,6 +149,78 @@ internal object ImageOps {
 }
 
 /**
+ * Geometric resampling used for stabilisation. For each destination pixel `q`, samples [src] at
+ * `c + R(angle) (q - c) * invZoom + (tx, ty)`, where `c` is the image centre and the rotation is
+ * clockwise-positive in image coordinates (y down). Edges are clamped.
+ */
+internal object Warp {
+    fun apply(
+        src: FloatArray, w: Int, h: Int, dst: FloatArray,
+        angle: Float, invZoom: Float, tx: Float, ty: Float, bicubic: Boolean,
+    ) {
+        val cx = (w - 1) / 2f
+        val cy = (h - 1) / 2f
+        val ca = kotlin.math.cos(angle) * invZoom
+        val sa = kotlin.math.sin(angle) * invZoom
+        Parallel.forRange(h) { y0, y1 ->
+            for (y in y0 until y1) {
+                val qy = y - cy
+                for (x in 0 until w) {
+                    val qx = x - cx
+                    val sx = cx + ca * qx - sa * qy + tx
+                    val sy = cy + sa * qx + ca * qy + ty
+                    dst[y * w + x] = if (bicubic) cubic(src, w, h, sx, sy) else linear(src, w, h, sx, sy)
+                }
+            }
+        }
+    }
+
+    fun linear(src: FloatArray, w: Int, h: Int, x: Float, y: Float): Float {
+        val fx = x.coerceIn(0f, (w - 1).toFloat())
+        val fy = y.coerceIn(0f, (h - 1).toFloat())
+        val ix = fx.toInt()
+        val iy = fy.toInt()
+        val tx = fx - ix
+        val ty = fy - iy
+        val ix1 = min(ix + 1, w - 1)
+        val iy1 = min(iy + 1, h - 1)
+        val top = src[iy * w + ix] * (1 - tx) + src[iy * w + ix1] * tx
+        val bottom = src[iy1 * w + ix] * (1 - tx) + src[iy1 * w + ix1] * tx
+        return top * (1 - ty) + bottom * ty
+    }
+
+    /** Catmull-Rom bicubic sample with clamped edges. */
+    fun cubic(src: FloatArray, w: Int, h: Int, x: Float, y: Float): Float {
+        val fx = x.coerceIn(0f, (w - 1).toFloat())
+        val fy = y.coerceIn(0f, (h - 1).toFloat())
+        val ix = fx.toInt()
+        val iy = fy.toInt()
+        val tx = fx - ix
+        val ty = fy - iy
+        var acc = 0f
+        for (j in -1..2) {
+            val row = min(max(iy + j, 0), h - 1) * w
+            val wy = catmullRom(ty, j)
+            var r = 0f
+            for (i in -1..2) r += catmullRom(tx, i) * src[row + min(max(ix + i, 0), w - 1)]
+            acc += wy * r
+        }
+        return acc
+    }
+
+    private fun catmullRom(t: Float, i: Int): Float {
+        val t2 = t * t
+        val t3 = t2 * t
+        return when (i) {
+            -1 -> -0.5f * t3 + t2 - 0.5f * t
+            0 -> 1.5f * t3 - 2.5f * t2 + 1f
+            1 -> -1.5f * t3 + 2f * t2 + 0.5f * t
+            else -> 0.5f * t3 - 0.5f * t2
+        }
+    }
+}
+
+/**
  * Resizes images by area averaging: each output pixel is the mean of the source area it covers.
  * This avoids the aliasing that point sampling creates, which motion amplification would otherwise
  * turn into visible shimmer.
